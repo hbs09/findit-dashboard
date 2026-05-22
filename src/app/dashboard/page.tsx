@@ -2,12 +2,10 @@ import { getCurrentSalon } from "@/lib/salon-context";
 import { createClient } from "@/lib/supabase/server";
 import { StatCard } from "@/components/stat-card";
 import { TodayAppointments } from "@/components/today-appointments";
-import {
-  CalendarCheck,
-  Euro,
-  Users as UsersIcon,
-  Clock,
-} from "lucide-react";
+import { WeeklyChart } from "@/components/weekly-chart";
+import { TopServices } from "@/components/top-services";
+import { PageHeader } from "@/components/page-header";
+import { CalendarCheck, Euro, Clock, TrendingUp } from "lucide-react";
 
 export default async function DashboardOverviewPage() {
   const { salon } = await getCurrentSalon();
@@ -15,23 +13,26 @@ export default async function DashboardOverviewPage() {
 
   const supabase = await createClient();
 
-  // Range de hoje (00:00 → 23:59 local)
+  // Range de hoje
   const start = new Date();
   start.setHours(0, 0, 0, 0);
   const end = new Date();
   end.setHours(23, 59, 59, 999);
 
-  // Range "amanhã" para preview
+  // Range últimos 7 dias (para chart)
+  const sevenDaysAgo = new Date();
+  sevenDaysAgo.setDate(sevenDaysAgo.getDate() - 6);
+  sevenDaysAgo.setHours(0, 0, 0, 0);
+
   const tomorrowStart = new Date(start);
   tomorrowStart.setDate(tomorrowStart.getDate() + 1);
   const tomorrowEnd = new Date(end);
   tomorrowEnd.setDate(tomorrowEnd.getDate() + 1);
 
-  // Buscar marcações de hoje + amanhã em paralelo
   const [
     { data: todayApps },
     { data: tomorrowApps },
-    { count: totalClientsCount },
+    { data: weekApps },
     { data: services },
   ] = await Promise.all([
     supabase
@@ -51,30 +52,60 @@ export default async function DashboardOverviewPage() {
       .lte("data_hora", tomorrowEnd.toISOString()),
     supabase
       .from("appointments")
-      .select("cliente_id", { count: "exact", head: true })
+      .select("id, data_hora, status, service_id")
       .eq("salon_id", salon.id)
-      .neq("status", "cancelado"),
+      .gte("data_hora", sevenDaysAgo.toISOString())
+      .lte("data_hora", end.toISOString()),
     supabase
       .from("services")
       .select("id, nome, preco, duracao_minutos")
       .eq("salon_id", salon.id),
   ]);
 
-  const servicesMap = new Map(
-    (services ?? []).map((s) => [s.id, s])
-  );
+  const servicesMap = new Map((services ?? []).map((s) => [s.id, s]));
 
-  // Receita estimada (apenas confirmados)
-  let revenue = 0;
+  // Stats hoje
   const confirmed = (todayApps ?? []).filter((a) => a.status === "confirmado");
+  const pending = (todayApps ?? []).filter((a) => a.status === "pendente");
+  let revenue = 0;
   for (const a of confirmed) {
     const s = servicesMap.get(a.service_id);
     if (s?.preco) revenue += Number(s.preco);
   }
 
-  const pending = (todayApps ?? []).filter((a) => a.status === "pendente");
+  // Receita 7 dias
+  let weekRevenue = 0;
+  for (const a of weekApps ?? []) {
+    if (a.status !== "confirmado") continue;
+    const s = servicesMap.get(a.service_id);
+    if (s?.preco) weekRevenue += Number(s.preco);
+  }
 
-  // Enriquecer marcações com nome do serviço
+  // Chart data — agrupar por dia
+  const chartData = buildWeekChart(weekApps ?? [], servicesMap);
+
+  // Top serviços (últimos 7 dias)
+  const serviceCounts = new Map<
+    string,
+    { name: string; count: number; revenue: number }
+  >();
+  for (const a of weekApps ?? []) {
+    if (a.status === "cancelado") continue;
+    const s = servicesMap.get(a.service_id);
+    if (!s) continue;
+    const entry = serviceCounts.get(s.id) ?? {
+      name: s.nome,
+      count: 0,
+      revenue: 0,
+    };
+    entry.count += 1;
+    entry.revenue += Number(s.preco) || 0;
+    serviceCounts.set(s.id, entry);
+  }
+  const topServices = Array.from(serviceCounts.values())
+    .sort((a, b) => b.count - a.count)
+    .slice(0, 5);
+
   const enriched = (todayApps ?? []).map((a) => ({
     ...a,
     service_name: servicesMap.get(a.service_id)?.nome ?? "Serviço",
@@ -86,14 +117,13 @@ export default async function DashboardOverviewPage() {
 
   return (
     <div className="p-8 max-w-7xl mx-auto">
-      <header className="mb-8">
-        <h1 className="text-3xl font-bold tracking-tight">Overview</h1>
-        <p className="text-slate-500 mt-1">
-          Resumo das tuas marcações de hoje, {formatToday()}.
-        </p>
-      </header>
+      <PageHeader
+        eyebrow="Hoje"
+        title={greeting()}
+        description={`${formatToday()} · ${salon.nome_salao}`}
+      />
 
-      <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4 mb-8">
+      <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4 mb-6">
         <StatCard
           label="Marcações hoje"
           value={(todayApps ?? []).length.toString()}
@@ -103,9 +133,9 @@ export default async function DashboardOverviewPage() {
         />
         <StatCard
           label="Receita estimada"
-          value={`${revenue.toFixed(2).replace(".", ",")} €`}
+          value={`${revenue.toFixed(0)} €`}
           icon={Euro}
-          sub="Apenas confirmadas"
+          sub="Apenas confirmadas hoje"
           tone="green"
         />
         <StatCard
@@ -116,12 +146,21 @@ export default async function DashboardOverviewPage() {
           tone={pending.length > 0 ? "amber" : "default"}
         />
         <StatCard
-          label="Amanhã"
-          value={tomorrowConfirmed.toString()}
-          icon={UsersIcon}
-          sub="Marcações ativas"
-          tone="default"
+          label="Últimos 7 dias"
+          value={`${weekRevenue.toFixed(0)} €`}
+          icon={TrendingUp}
+          sub={`${tomorrowConfirmed} marcadas para amanhã`}
+          tone="blue"
         />
+      </div>
+
+      <div className="grid grid-cols-1 lg:grid-cols-3 gap-6 mb-6">
+        <div className="lg:col-span-2">
+          <WeeklyChart data={chartData} />
+        </div>
+        <div>
+          <TopServices items={topServices} />
+        </div>
       </div>
 
       <TodayAppointments items={enriched} />
@@ -129,9 +168,51 @@ export default async function DashboardOverviewPage() {
   );
 }
 
+type WeekApp = { id: string; data_hora: string; status: string; service_id: string };
+
+function buildWeekChart(
+  apps: WeekApp[],
+  services: Map<string, { id: string; nome: string; preco: number; duracao_minutos: number }>
+) {
+  const result: { label: string; date: string; marcacoes: number; receita: number }[] = [];
+
+  for (let i = 6; i >= 0; i--) {
+    const d = new Date();
+    d.setDate(d.getDate() - i);
+    d.setHours(0, 0, 0, 0);
+    const next = new Date(d);
+    next.setDate(next.getDate() + 1);
+
+    const dayApps = apps.filter((a) => {
+      const t = new Date(a.data_hora).getTime();
+      return t >= d.getTime() && t < next.getTime();
+    });
+    const conf = dayApps.filter((a) => a.status === "confirmado");
+    let rev = 0;
+    for (const a of conf) {
+      const s = services.get(a.service_id);
+      if (s?.preco) rev += Number(s.preco);
+    }
+
+    result.push({
+      label: d.toLocaleDateString("pt-PT", { weekday: "short" }).replace(".", ""),
+      date: d.toISOString().split("T")[0],
+      marcacoes: dayApps.filter((a) => a.status !== "cancelado").length,
+      receita: rev,
+    });
+  }
+  return result;
+}
+
+function greeting() {
+  const h = new Date().getHours();
+  if (h < 12) return "Bom dia 👋";
+  if (h < 19) return "Boa tarde 👋";
+  return "Boa noite 👋";
+}
+
 function formatToday() {
-  const d = new Date();
-  return d.toLocaleDateString("pt-PT", {
+  return new Date().toLocaleDateString("pt-PT", {
     weekday: "long",
     day: "numeric",
     month: "long",

@@ -1,10 +1,18 @@
-import { ComingSoon } from "@/components/coming-soon";
+import { getCurrentSalon } from "@/lib/salon-context";
+import { createClient } from "@/lib/supabase/server";
+import { GaleriaView } from "./galeria-view";
 
-export default function GaleriaPage() {
-  return (
-    <ComingSoon
-      title="Galeria"
-      description="Faz upload, ordena e gere as fotos do portfolio do teu salão."
-    />
-  );
+export default async function GaleriaPage() {
+  const { salon } = await getCurrentSalon();
+  if (!salon) return null;
+
+  const supabase = await createClient();
+
+  const { data: images } = await supabase
+    .from("salon_portfolio_images")
+    .select("id, image_url, description, position")
+    .eq("salon_id", salon.id)
+    .order("position", { ascending: true });
+
+  return <GaleriaView salonId={salon.id} initialImages={images ?? []} />;
 }
